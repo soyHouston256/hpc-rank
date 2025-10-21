@@ -38,12 +38,54 @@ echo ""
 # Crear/limpiar archivo de resultados
 echo "Procesos,Elementos,Rep,Tiempo_Ejecucion,Tiempo_Computo,Tiempo_Comunicacion" > "$OUTPUT_FILE"
 
+# Función para calcular raíz cuadrada entera sin bc (método de Newton)
+sqrt_int() {
+    local n=$1
+    local x=$n
+    local y=$(( (x + 1) / 2 ))
+    while [ $y -lt $x ]; do
+        x=$y
+        y=$(( (x + n / x) / 2 ))
+    done
+    echo $x
+}
+
 # Función para verificar si un número es cuadrado perfecto
 es_cuadrado_perfecto() {
     local n=$1
-    local sqrt=$(echo "sqrt($n)" | bc)
+    local sqrt=$(sqrt_int $n)
     local cuadrado=$((sqrt * sqrt))
     [ $cuadrado -eq $n ]
+}
+
+# Función para verificar si la configuración excede el límite del buffer
+es_configuracion_valida() {
+    local procs=$1
+    local elementos=$2
+
+    # Caso especial: con 1 proceso no hay comunicación, siempre es válido
+    if [ $procs -eq 1 ]; then
+        return 0
+    fi
+
+    local sqrt_procs=$(sqrt_int $procs)
+
+    # Calcular el tamaño del mensaje por proceso
+    local msg_size=$((elementos / procs))
+
+    # Después del gossip, cada proceso acumula datos de sqrt_procs procesos
+    # Este es el dato que se envía por MPI y debe caber en el buffer
+    local max_data=$((msg_size * sqrt_procs))
+
+    # El buffer en el código es de 10000 caracteres
+    # Dejar espacio solo para el terminador null (+1)
+    local buffer_limit=9999
+
+    if [ $max_data -gt $buffer_limit ]; then
+        return 1  # No válida
+    else
+        return 0  # Válida
+    fi
 }
 
 # Función para ejecutar una prueba
@@ -51,26 +93,43 @@ ejecutar_prueba() {
     local procs=$1
     local elementos=$2
     local rep=$3
-    
+
     echo -e "${YELLOW}Ejecutando: P=$procs, N=$elementos, Rep=$rep${NC}"
-    
-    # Ejecutar el programa y capturar la salida
+
+    # Verificar si la configuración es válida antes de ejecutar
+    if ! es_configuracion_valida $procs $elementos; then
+        echo -e "${RED}  ⚠ Configuración excede límite de buffer (saltando)${NC}"
+        echo "$procs,$elementos,$rep,BUFFER_EXCEEDED,BUFFER_EXCEEDED,BUFFER_EXCEEDED" >> "$OUTPUT_FILE"
+        echo "Saltado: P=$procs, N=$elementos, Rep=$rep (excede límite de buffer)" >> "$LOG_FILE"
+        return
+    fi
+
+    # Ejecutar el programa y capturar stdout y stderr por separado
     output=$(mpiexec -n $procs $EXECUTABLE $elementos 2>&1)
-    
-    if [ $? -eq 0 ]; then
+    exit_code=$?
+
+    if [ $exit_code -eq 0 ]; then
         # Extraer los tiempos de la salida
         tiempo_ejecucion=$(echo "$output" | grep "Ejecucion:" | awk '{print $2}')
         tiempo_computo=$(echo "$output" | grep "Computo:" | awk '{print $2}')
         tiempo_comunicacion=$(echo "$output" | grep "Comunicacion:" | awk '{print $2}')
-        
-        # Guardar en el archivo CSV
-        echo "$procs,$elementos,$rep,$tiempo_ejecucion,$tiempo_computo,$tiempo_comunicacion" >> "$OUTPUT_FILE"
-        
-        echo -e "${GREEN}  ✓ Ejecución: ${tiempo_ejecucion}s | Cómputo: ${tiempo_computo}s | Comunicación: ${tiempo_comunicacion}s${NC}"
+
+        # Verificar que se obtuvieron los tiempos
+        if [ -z "$tiempo_ejecucion" ] || [ -z "$tiempo_computo" ] || [ -z "$tiempo_comunicacion" ]; then
+            echo -e "${RED}  ✗ Error: no se pudieron extraer los tiempos${NC}"
+            echo "$procs,$elementos,$rep,ERROR,ERROR,ERROR" >> "$OUTPUT_FILE"
+            echo "Error extrayendo tiempos para P=$procs, N=$elementos, Rep=$rep:" >> "$LOG_FILE"
+            echo "$output" >> "$LOG_FILE"
+            echo "" >> "$LOG_FILE"
+        else
+            # Guardar en el archivo CSV
+            echo "$procs,$elementos,$rep,$tiempo_ejecucion,$tiempo_computo,$tiempo_comunicacion" >> "$OUTPUT_FILE"
+            echo -e "${GREEN}  ✓ Ejecución: ${tiempo_ejecucion}s | Cómputo: ${tiempo_computo}s | Comunicación: ${tiempo_comunicacion}s${NC}"
+        fi
     else
-        echo -e "${RED}  ✗ Error en la ejecución${NC}"
+        echo -e "${RED}  ✗ Error en la ejecución (código: $exit_code)${NC}"
         echo "$procs,$elementos,$rep,ERROR,ERROR,ERROR" >> "$OUTPUT_FILE"
-        echo "Error con P=$procs, N=$elementos, Rep=$rep:" >> "$LOG_FILE"
+        echo "Error con P=$procs, N=$elementos, Rep=$rep (exit code: $exit_code):" >> "$LOG_FILE"
         echo "$output" >> "$LOG_FILE"
         echo "" >> "$LOG_FILE"
     fi
@@ -138,10 +197,11 @@ import sys
 try:
     # Leer el archivo CSV
     df = pd.read_csv('resultados_benchmark.csv')
-    
-    # Filtrar errores y skips
-    df = df[(df['Tiempo_Ejecucion'] != 'ERROR') & 
-            (df['Tiempo_Ejecucion'] != 'SKIP')]
+
+    # Filtrar errores, skips y configuraciones que exceden buffer
+    df = df[(df['Tiempo_Ejecucion'] != 'ERROR') &
+            (df['Tiempo_Ejecucion'] != 'SKIP') &
+            (df['Tiempo_Ejecucion'] != 'BUFFER_EXCEEDED')]
     
     # Convertir a numérico
     df['Tiempo_Ejecucion'] = pd.to_numeric(df['Tiempo_Ejecucion'])
